@@ -62,11 +62,9 @@ warnings.filterwarnings('ignore')
 import cv2
 import numpy as np
 import pandas as pd
-from PIL import Image
 from tqdm.auto import tqdm
 
 import matplotlib.pyplot as plt
-import seaborn as sns
 
 import torch
 import torch.nn as nn
@@ -74,15 +72,14 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, random_split
 
-import torchvision.transforms as transforms
-
 import timm
 import segmentation_models_pytorch as smp
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import f1_score, jaccard_score, precision_score, recall_score
+
+print("✓ All imports successful!\n")
 
 # ============================================================================
 # CONFIGURATION

@@ -30,23 +30,20 @@ print("Installing required packages...")
 import sys
 import subprocess
 
-# Fix numpy/scipy version conflicts first
-packages_to_install = [
-    'numpy==1.26.4',
-    'scipy==1.13.1',
-    'timm',
-    'segmentation-models-pytorch',
-    'albumentations==1.4.0'
-]
+# Install packages in specific order to avoid conflicts
+print("Step 1/3: Installing core packages...")
+subprocess.check_call([sys.executable, "-m", "pip", "install", "-q",
+                      "timm", "segmentation-models-pytorch"])
 
-for package in packages_to_install:
-    try:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", package])
-        print(f"✓ Installed {package}")
-    except Exception as e:
-        print(f"✗ Failed to install {package}: {e}")
+print("Step 2/3: Installing albumentations...")
+subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "albumentations==1.4.0"])
 
-print("\n✓ All packages installed!\n")
+print("Step 3/3: Fixing numpy/scipy versions...")
+# Force reinstall numpy and scipy to fix version conflicts
+subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "--force-reinstall",
+                      "--no-deps", "numpy==1.26.4", "scipy==1.13.1"])
+
+print("\n✓ All packages installed and fixed!\n")
 
 # ============================================================================
 # IMPORTS

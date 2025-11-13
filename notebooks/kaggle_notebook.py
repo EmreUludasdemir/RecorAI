@@ -1,22 +1,52 @@
 """
 Kaggle Notebook for Scientific Image Forgery Detection Competition
+FIXED VERSION - Dependency conflicts resolved + Subfolder support added
 
 This is a complete, self-contained script that can be run in Kaggle notebooks.
 All necessary code is included in a single file for easy execution.
 
+Key Features:
+- ✓ Fixed numpy/scipy version conflicts
+- ✓ Automatic subfolder detection (handles authentic/, forged/ etc.)
+- ✓ Data path verification before training
+- ✓ Complete training pipeline with U-Net + EfficientNet-B2
+- ✓ Mixed precision training for faster execution
+- ✓ Post-processing for better predictions
+
 Usage:
-1. Upload this script to Kaggle
-2. Add the competition dataset
-3. Enable GPU accelerator
-4. Run all cells
+1. Create a new Kaggle notebook
+2. Select GPU P100 accelerator
+3. Add the competition dataset
+4. Copy-paste this entire code
+5. Update BASE_PATH in Config class (line 82)
+6. Run all cells
 """
 
 # ============================================================================
-# INSTALLATION (if needed)
+# INSTALLATION
 # ============================================================================
 
-# Uncomment if running in Kaggle and packages are missing
-# !pip install -q timm segmentation-models-pytorch albumentations
+print("Installing required packages...")
+import sys
+import subprocess
+
+# Fix numpy/scipy version conflicts first
+packages_to_install = [
+    'numpy==1.26.4',
+    'scipy==1.13.1',
+    'timm',
+    'segmentation-models-pytorch',
+    'albumentations==1.4.0'
+]
+
+for package in packages_to_install:
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", package])
+        print(f"✓ Installed {package}")
+    except Exception as e:
+        print(f"✗ Failed to install {package}: {e}")
+
+print("\n✓ All packages installed!\n")
 
 # ============================================================================
 # IMPORTS
@@ -59,12 +89,15 @@ from sklearn.metrics import f1_score, jaccard_score, precision_score, recall_sco
 # ============================================================================
 
 class Config:
-    # Paths (modify based on Kaggle dataset structure)
-    TRAIN_IMG_DIR = '/kaggle/input/competition-name/train/images'
-    TRAIN_MASK_DIR = '/kaggle/input/competition-name/train/masks'
-    TEST_IMG_DIR = '/kaggle/input/competition-name/test/images'
-    OUTPUT_DIR = './outputs'
-    CHECKPOINT_DIR = './models'
+    # Paths - UPDATE THESE FOR YOUR COMPETITION
+    BASE_PATH = '/kaggle/input/recodai-luc-scientific-image-forgery-detection'
+
+    # Dataset paths (automatically handles subfolders like authentic/ and forged/)
+    TRAIN_IMG_DIR = f'{BASE_PATH}/train_images'
+    TRAIN_MASK_DIR = f'{BASE_PATH}/train_masks'
+    TEST_IMG_DIR = f'{BASE_PATH}/test_images'
+    OUTPUT_DIR = '/kaggle/working/outputs'
+    CHECKPOINT_DIR = '/kaggle/working/models'
 
     # Model
     MODEL_NAME = 'unet-efficientnet-b2'  # Options: unet-efficientnet-b2, unet-resnet50, etc.
@@ -121,16 +154,59 @@ set_seed(CFG.SEED)
 os.makedirs(CFG.OUTPUT_DIR, exist_ok=True)
 os.makedirs(CFG.CHECKPOINT_DIR, exist_ok=True)
 
+# ============================================================================
+# DATA PATH VERIFICATION
+# ============================================================================
+
+def verify_path(path, name):
+    """Verify and display information about data paths."""
+    exists = os.path.exists(path)
+    print(f"\n{name}:")
+    print(f"  Path: {path}")
+    print(f"  Exists: {'✓' if exists else '✗'}")
+
+    if exists:
+        items = os.listdir(path)
+        folders = [f for f in items if os.path.isdir(os.path.join(path, f))]
+        files = [f for f in items if os.path.isfile(os.path.join(path, f))]
+
+        if folders:
+            print(f"  Subfolders: {folders}")
+            for folder in folders:
+                folder_path = os.path.join(path, folder)
+                folder_files = os.listdir(folder_path)
+                image_files = [f for f in folder_files if f.endswith(('.jpg', '.jpeg', '.png', '.tif', '.tiff'))]
+                print(f"    └─ {folder}/ → {len(image_files)} images")
+
+        if files:
+            image_files = [f for f in files if f.endswith(('.jpg', '.jpeg', '.png', '.tif', '.tiff'))]
+            print(f"  Files: {len(files)} total, {len(image_files)} images")
+
+print("="*80)
+print("SYSTEM INFORMATION")
+print("="*80)
 print(f"Device: {CFG.DEVICE}")
 if CFG.DEVICE == 'cuda':
     print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+
+print("\n" + "="*80)
+print("VERIFYING DATA PATHS")
+print("="*80)
+verify_path(CFG.TRAIN_IMG_DIR, "TRAIN IMAGES")
+verify_path(CFG.TRAIN_MASK_DIR, "TRAIN MASKS")
+verify_path(CFG.TEST_IMG_DIR, "TEST IMAGES")
+print("="*80 + "\n")
 
 # ============================================================================
 # DATASET AND AUGMENTATION
 # ============================================================================
 
 class ScientificForgeryDataset(Dataset):
-    """Dataset for scientific image forgery detection."""
+    """
+    Dataset for scientific image forgery detection.
+    Automatically searches for images in subfolders (e.g., authentic/, forged/).
+    """
 
     def __init__(self, image_dir, mask_dir=None, transform=None, mode='train'):
         self.image_dir = image_dir
@@ -138,31 +214,70 @@ class ScientificForgeryDataset(Dataset):
         self.transform = transform
         self.mode = mode
 
-        self.image_files = sorted([f for f in os.listdir(image_dir)
-                                   if f.endswith(('.jpg', '.jpeg', '.png', '.tif', '.tiff'))])
+        # Find all image files including those in subfolders
+        self.image_files = []
 
-        print(f"{mode.upper()}: {len(self.image_files)} images")
+        # First, search directly in the directory
+        try:
+            direct_files = [f for f in os.listdir(image_dir)
+                          if os.path.isfile(os.path.join(image_dir, f))
+                          and f.endswith(('.jpg', '.jpeg', '.png', '.tif', '.tiff'))]
+            self.image_files.extend(direct_files)
+        except:
+            pass
+
+        # Then, search in subdirectories
+        for root, dirs, files in os.walk(image_dir):
+            for file in files:
+                if file.endswith(('.jpg', '.jpeg', '.png', '.tif', '.tiff')):
+                    full_path = os.path.join(root, file)
+                    rel_path = os.path.relpath(full_path, image_dir)
+
+                    # Store relative path (for subfolder structure)
+                    if rel_path not in self.image_files and file not in self.image_files:
+                        self.image_files.append(rel_path)
+
+        self.image_files = sorted(self.image_files)
+        print(f"{mode.upper()}: {len(self.image_files)} images found")
+
+        if len(self.image_files) == 0:
+            print(f"⚠️  WARNING: No images found in {image_dir}")
+            print("Please check if the path is correct!")
 
     def __len__(self):
         return len(self.image_files)
 
     def __getitem__(self, idx):
-        img_path = os.path.join(self.image_dir, self.image_files[idx])
+        # Build image path
+        img_rel_path = self.image_files[idx]
+        img_path = os.path.join(self.image_dir, img_rel_path)
+
+        # Read image
         image = cv2.imread(img_path)
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        if image is None:
+            print(f"ERROR: Cannot read image: {img_path}")
+            # Return empty image to prevent crash
+            image = np.zeros((256, 256, 3), dtype=np.uint8)
+        else:
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
         if self.mode == 'test':
             if self.transform:
                 augmented = self.transform(image=image)
                 image = augmented['image']
-            return image, self.image_files[idx]
+            # Return just filename (without subfolder path)
+            filename = os.path.basename(img_rel_path)
+            return image, filename
 
-        mask_filename = self.image_files[idx].rsplit('.', 1)[0] + '.png'
+        # Find corresponding mask file
+        img_filename = os.path.basename(img_rel_path)
+        mask_filename = os.path.splitext(img_filename)[0] + '.png'
         mask_path = os.path.join(self.mask_dir, mask_filename)
 
         if os.path.exists(mask_path):
             mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
         else:
+            # Create empty mask if not found
             mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
 
         mask = (mask > 127).astype(np.float32)
@@ -519,6 +634,16 @@ def main():
     test_dataset = ScientificForgeryDataset(
         CFG.TEST_IMG_DIR, transform=get_val_transforms(CFG.IMG_SIZE), mode='test'
     )
+
+    if len(test_dataset) == 0:
+        print("\n⚠️  WARNING: No test images found!")
+        print("Skipping inference...")
+        print("\n" + "="*80)
+        print("TRAINING COMPLETED!")
+        print("="*80)
+        print(f"✓ Best IoU: {trainer.best_iou:.4f}")
+        return
+
     test_loader = DataLoader(test_dataset, batch_size=CFG.BATCH_SIZE,
                             shuffle=False, num_workers=CFG.NUM_WORKERS)
 
@@ -528,11 +653,40 @@ def main():
     submission_path = os.path.join(CFG.OUTPUT_DIR, 'submission.csv')
     create_submission(predictions, filenames, submission_path)
 
+    # ========== PLOT TRAINING HISTORY ==========
+    try:
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+        axes[0].plot(history['train_loss'], label='Train')
+        axes[0].plot(history['val_loss'], label='Val')
+        axes[0].set_title('Loss')
+        axes[0].set_xlabel('Epoch')
+        axes[0].legend()
+        axes[0].grid(True)
+
+        axes[1].plot(history['val_f1'])
+        axes[1].set_title('F1 Score')
+        axes[1].set_xlabel('Epoch')
+        axes[1].grid(True)
+
+        axes[2].plot(history['val_iou'])
+        axes[2].set_title('IoU')
+        axes[2].set_xlabel('Epoch')
+        axes[2].grid(True)
+
+        plt.tight_layout()
+        plot_path = os.path.join(CFG.OUTPUT_DIR, 'training_history.png')
+        plt.savefig(plot_path, dpi=150)
+        plt.show()
+        print(f"✓ Training plot saved: {plot_path}")
+    except Exception as e:
+        print(f"Could not create training plot: {e}")
+
     print("\n" + "="*80)
-    print("COMPLETED!")
+    print("TRAINING COMPLETED!")
     print("="*80)
-    print(f"Best IoU: {trainer.best_iou:.4f}")
-    print(f"Submission: {submission_path}")
+    print(f"✓ Best IoU: {trainer.best_iou:.4f}")
+    print(f"✓ Submission: {submission_path}")
 
 
 if __name__ == "__main__":

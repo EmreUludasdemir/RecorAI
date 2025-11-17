@@ -544,27 +544,68 @@ def predict_test_set(model, test_loader, device, post_process=True):
     return predictions, filenames
 
 
-def rle_encode(mask):
-    """RLE encoding for submission."""
-    pixels = mask.flatten()
-    pixels = np.concatenate([[0], pixels, [0]])
-    runs = np.where(pixels[1:] != pixels[:-1])[0] + 1
-    runs[1::2] -= runs[::2]
-    return ' '.join(str(x) for x in runs)
+def rle_encode(mask, fg_val=1):
+    """
+    Official RLE encoder for competition (JSON format).
+    Returns: "[start, length, start, length, ...]"
+    """
+    import json
+    # Transpose and flatten (column-major order)
+    dots = np.where(mask.T.flatten() == fg_val)[0]
+
+    run_lengths = []
+    prev = -2
+
+    for b in dots:
+        if b > prev + 1:
+            run_lengths.extend([int(b + 1), 0])  # 1-based indexing
+        run_lengths[-1] += 1
+        prev = b
+
+    return json.dumps(run_lengths)
 
 
-def create_submission(predictions, filenames, output_path='submission.csv'):
-    """Create submission file."""
+def is_authentic(mask, threshold=0.001):
+    """Check if mask is authentic (no significant forgery)."""
+    if mask is None:
+        return True
+    forgery_ratio = np.sum(mask > 0) / mask.size
+    return forgery_ratio < threshold
+
+
+def create_submission(predictions, filenames, output_path='submission.csv', threshold=0.001):
+    """
+    Create submission file in official competition format.
+
+    Format:
+        case_id,annotation
+        1,authentic
+        2,"[123, 4]"
+    """
     submission_data = []
 
     for pred, fname in tqdm(zip(predictions, filenames), desc='Creating submission'):
-        mask_binary = (pred > 0).astype(np.uint8)
-        rle = rle_encode(mask_binary)
-        submission_data.append({'image_id': fname, 'rle': rle})
+        # Get case_id (remove file extension)
+        case_id = fname.rsplit('.', 1)[0]
 
+        # Convert to binary mask
+        mask_binary = (pred > 0).astype(np.uint8)
+
+        # Check if authentic or forged
+        if is_authentic(mask_binary, threshold=threshold):
+            annotation = 'authentic'
+        else:
+            annotation = rle_encode(mask_binary, fg_val=1)
+
+        submission_data.append({'case_id': case_id, 'annotation': annotation})
+
+    # Create DataFrame with correct column order
     df = pd.DataFrame(submission_data)
+    df = df[['case_id', 'annotation']]
     df.to_csv(output_path, index=False)
-    print(f"Submission saved to {output_path}")
+
+    print(f"\n✓ Submission saved: {output_path}")
+    print(f"  Total: {len(df)} | Authentic: {sum(df['annotation'] == 'authentic')} | Forged: {sum(df['annotation'] != 'authentic')}")
 
 # ============================================================================
 # MAIN EXECUTION

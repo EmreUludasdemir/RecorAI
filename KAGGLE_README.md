@@ -245,17 +245,44 @@ with torch.no_grad():
         preds.extend(masks)
         names.extend(ns)
 
-# RLE
-def rle_encode(mask):
-    p = mask.flatten()
-    p = np.concatenate([[0], p, [0]])
-    r = np.where(p[1:] != p[:-1])[0] + 1
-    r[1::2] -= r[::2]
-    return ' '.join(str(x) for x in r)
+# RLE ENCODING (Official Competition Format)
+import json
 
-sub_data = [{'image_id': n, 'rle': rle_encode((p > 0).astype(np.uint8))} for p, n in zip(preds, names)]
+def rle_encode(mask, fg_val=1):
+    """Official RLE encoder - Returns JSON array format"""
+    dots = np.where(mask.T.flatten() == fg_val)[0]
+    run_lengths = []
+    prev = -2
+    for b in dots:
+        if b > prev + 1:
+            run_lengths.extend([int(b + 1), 0])
+        run_lengths[-1] += 1
+        prev = b
+    return json.dumps(run_lengths)
+
+def is_authentic(mask, threshold=0.001):
+    """Check if image is authentic (no forgery)"""
+    return np.sum(mask > 0) / mask.size < threshold
+
+# CREATE SUBMISSION (Official Format: case_id, annotation)
+sub_data = []
+for p, n in zip(preds, names):
+    case_id = n.rsplit('.', 1)[0]  # Remove file extension
+    mask_bin = (p > 0).astype(np.uint8)
+
+    if is_authentic(mask_bin):
+        annotation = 'authentic'
+    else:
+        annotation = rle_encode(mask_bin)
+
+    sub_data.append({'case_id': case_id, 'annotation': annotation})
+
+df = pd.DataFrame(sub_data)[['case_id', 'annotation']]
 sub_path = f"{CFG.OUT}/submission.csv"
-pd.DataFrame(sub_data).to_csv(sub_path, index=False)
+df.to_csv(sub_path, index=False)
+
+print(f"\n✓ Submission: {sub_path}")
+print(f"  Authentic: {sum(df['annotation'] == 'authentic')} | Forged: {sum(df['annotation'] != 'authentic')}")
 
 print("\n" + "="*70)
 print("✅ TAMAMLANDI!")

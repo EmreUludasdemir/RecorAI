@@ -1,728 +1,1127 @@
-"""
-Kaggle Notebook for Scientific Image Forgery Detection Competition
-FIXED VERSION - Dependency conflicts resolved + Subfolder support added
+# %% [markdown]
+# # Recod.ai/LUC — Scientific Image Forgery Detection (Pixel-level Segmentation)
+# **Single-file Kaggle notebook** (Python) with:
+# - Smart Kaggle path detection
+# - Lazy + memory-efficient pipeline (FP16 AMP, grad accumulation, optional grad checkpointing)
+# - 3-model ensemble (UNet+EffB4, UNet++ + ResNet101, DeepLabV3+ + EffB3)
+# - 5-Fold CV, progressive resizing (256→384→512), cosine warm restarts, early stopping
+# - Heavy domain augmentations + 6x TTA
+# - Post-processing + RLE submission
+#
+# ✅ You can run as a Kaggle Notebook (copy-paste into a single notebook .ipynb, or a .py notebook).
+# ⚠️ If internet is OFF and packages are missing, you must either enable internet for the run,
+# or attach a dataset with wheels and install from there.
 
-This is a complete, self-contained script that can be run in Kaggle notebooks.
-All necessary code is included in a single file for easy execution.
+# %% [code]
+import os, gc, sys, re, math, json, time, random, glob
+from dataclasses import dataclass
+from typing import Optional, List, Dict, Tuple
 
-Key Features:
-- ✓ Fixed numpy/scipy version conflicts
-- ✓ Automatic subfolder detection (handles authentic/, forged/ etc.)
-- ✓ Data path verification before training
-- ✓ Complete training pipeline with U-Net + EfficientNet-B2
-- ✓ Mixed precision training for faster execution
-- ✓ Post-processing for better predictions
-
-Usage:
-1. Create a new Kaggle notebook
-2. Select GPU P100 accelerator
-3. Add the competition dataset
-4. Copy-paste this entire code
-5. Update BASE_PATH in Config class (line 82)
-6. Run all cells
-"""
-
-# ============================================================================
-# INSTALLATION
-# ============================================================================
-
-print("Installing required packages...")
-import sys
-import subprocess
-
-# Install packages in specific order to avoid conflicts
-print("Step 1/3: Installing core packages...")
-subprocess.check_call([sys.executable, "-m", "pip", "install", "-q",
-                      "timm", "segmentation-models-pytorch"])
-
-print("Step 2/3: Installing albumentations...")
-subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "albumentations==1.4.0"])
-
-print("Step 3/3: Fixing numpy/scipy versions...")
-# Force reinstall numpy and scipy to fix version conflicts
-subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "--force-reinstall",
-                      "--no-deps", "numpy==1.26.4", "scipy==1.13.1"])
-
-print("\n✓ All packages installed and fixed!\n")
-
-# ============================================================================
-# IMPORTS
-# ============================================================================
-
-import os
-import sys
-import time
-import random
-import warnings
-warnings.filterwarnings('ignore')
-
-import cv2
 import numpy as np
 import pandas as pd
+
+# Try imports; if missing, install (may require internet unless already available/cached)
+def _pip_install(pkgs: List[str]):
+    import subprocess
+    cmd = [sys.executable, "-m", "pip", "install", "-q"] + pkgs
+    print("Running:", " ".join(cmd))
+    subprocess.check_call(cmd)
+
+try:
+    import cv2
+except Exception as e:
+    raise RuntimeError("OpenCV (cv2) is required. Please enable it in Kaggle environment.") from e
+
+try:
+    import albumentations as A
+    from albumentations.pytorch import ToTensorV2
+except Exception:
+    _pip_install(["albumentations"])
+    import albumentations as A
+    from albumentations.pytorch import ToTensorV2
+
+try:
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    from torch.utils.data import Dataset, DataLoader
+except Exception as e:
+    raise RuntimeError("PyTorch is required in Kaggle GPU runtime.") from e
+
+try:
+    import segmentation_models_pytorch as smp
+except Exception:
+    _pip_install(["segmentation-models-pytorch"])
+    import segmentation_models_pytorch as smp
+
+try:
+    from sklearn.model_selection import KFold
+except Exception:
+    _pip_install(["scikit-learn"])
+    from sklearn.model_selection import KFold
+
 from tqdm.auto import tqdm
 
-import matplotlib.pyplot as plt
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, random_split
+# %% [markdown]
+# ## [Cell 1] Imports & Config
 
-import timm
-import segmentation_models_pytorch as smp
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
+# %% [code]
+@dataclass
+class CFG:
+    seed: int = 42
+    num_folds: int = 5
 
-from sklearn.metrics import f1_score, jaccard_score, precision_score, recall_score
+    # Time / training budget
+    max_epochs_per_stage: Tuple[int,int,int] = (8, 8, 14)  # 256, 384, 512
+    early_stop_patience: int = 10
+    fold_time_limit_minutes: int = 120  # ~2 hours per fold target (adjust)
 
-print("✓ All imports successful!\n")
+    # Image sizes (progressive resizing)
+    sizes: Tuple[int,int,int] = (256, 384, 512)
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
+    # Dataloader
+    num_workers: int = 2
+    pin_memory: bool = True
 
-class Config:
-    # Paths - UPDATE THESE FOR YOUR COMPETITION
-    BASE_PATH = '/kaggle/input/recodai-luc-scientific-image-forgery-detection'
+    # Batch / memory
+    batch_size: int = 8              # actual batch
+    accumulation_steps: int = 2      # effective batch ~ batch_size * accumulation_steps
+    grad_clip: float = 1.0
 
-    # Dataset paths (automatically handles subfolders like authentic/ and forged/)
-    TRAIN_IMG_DIR = f'{BASE_PATH}/train_images'
-    TRAIN_MASK_DIR = f'{BASE_PATH}/train_masks'
-    TEST_IMG_DIR = f'{BASE_PATH}/test_images'
-    OUTPUT_DIR = '/kaggle/working/outputs'
-    CHECKPOINT_DIR = '/kaggle/working/models'
+    # Optim
+    lr: float = 2e-4
+    weight_decay: float = 1e-4
+    t_max_restart: int = 10  # warm restart period (epochs), used via WarmRestarts
 
-    # Model
-    MODEL_NAME = 'unet-efficientnet-b2'  # Options: unet-efficientnet-b2, unet-resnet50, etc.
-    ENCODER = 'efficientnet-b2'
-    PRETRAINED = 'imagenet'
+    # AMP / performance
+    use_amp: bool = True
+    enable_grad_checkpointing: bool = True
 
-    # Training
-    BATCH_SIZE = 16
-    NUM_EPOCHS = 100
-    LEARNING_RATE = 1e-4
-    WEIGHT_DECAY = 1e-4
-    IMG_SIZE = 384
-    VAL_SPLIT = 0.2
-
-    # Loss
-    LOSS_NAME = 'combined'  # Options: bce, dice, combined, focal_dice
-
-    # Training options
-    MIXED_PRECISION = True
-    MODEL_EMA = True
-    EMA_DECAY = 0.9999
-    EARLY_STOPPING_PATIENCE = 15
+    # Thresholding & postprocess
+    default_thr: float = 0.50
+    min_area: int = 100
 
     # Inference
-    USE_TTA = False
-    POST_PROCESS = True
-    MIN_AREA = 100
+    tta: bool = True
+    tta_modes: Tuple[str,...] = ("original","hflip","vflip","rot90","rot180","rot270")
 
-    # Other
-    SEED = 42
-    NUM_WORKERS = 2
-    DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+    # Ensemble weights
+    ens_w: Tuple[float,float,float] = (0.40, 0.35, 0.25)  # model1, model2, model3
 
-CFG = Config()
+    # Debug / quick run
+    debug: bool = False
+    debug_n: int = 300   # samples if debug
+    save_dir: str = "/kaggle/working"
 
-# ============================================================================
-# UTILITIES
-# ============================================================================
+CFG = CFG()
 
-def set_seed(seed=42):
-    """Set random seed for reproducibility."""
+def set_seed(seed: int = 42):
     random.seed(seed)
     np.random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    os.environ['PYTHONHASHSEED'] = str(seed)
+    torch.backends.cudnn.benchmark = True  # faster
+    torch.backends.cudnn.deterministic = False
 
-set_seed(CFG.SEED)
+set_seed(CFG.seed)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Device:", device)
 
-# Create directories
-os.makedirs(CFG.OUTPUT_DIR, exist_ok=True)
-os.makedirs(CFG.CHECKPOINT_DIR, exist_ok=True)
 
-# ============================================================================
-# DATA PATH VERIFICATION
-# ============================================================================
+# %% [markdown]
+# ## [Cell 2] Kaggle Path Detection (dynamic)
+# Finds competition root, train/test images, masks (if present), train csv, sample_submission.
 
-def verify_path(path, name):
-    """Verify and display information about data paths."""
-    exists = os.path.exists(path)
-    print(f"\n{name}:")
-    print(f"  Path: {path}")
-    print(f"  Exists: {'✓' if exists else '✗'}")
+# %% [code]
+def list_dir(path: str, max_items: int = 50):
+    items = sorted(glob.glob(os.path.join(path, "*")))
+    print(f"[{path}] items={len(items)}")
+    for x in items[:max_items]:
+        print("  -", os.path.basename(x))
+    if len(items) > max_items:
+        print("  ...")
 
-    if exists:
-        items = os.listdir(path)
-        folders = [f for f in items if os.path.isdir(os.path.join(path, f))]
-        files = [f for f in items if os.path.isfile(os.path.join(path, f))]
+def find_comp_root() -> str:
+    # User-specified expected path
+    preferred = "/kaggle/input/recodai-luc-scientific-image-forgery-detection"
+    if os.path.exists(preferred):
+        return preferred
 
-        if folders:
-            print(f"  Subfolders: {folders}")
-            for folder in folders:
-                folder_path = os.path.join(path, folder)
-                folder_files = os.listdir(folder_path)
-                image_files = [f for f in folder_files if f.endswith(('.jpg', '.jpeg', '.png', '.tif', '.tiff'))]
-                print(f"    └─ {folder}/ → {len(image_files)} images")
+    # Otherwise scan /kaggle/input
+    base = "/kaggle/input"
+    if not os.path.exists(base):
+        raise FileNotFoundError("/kaggle/input not found (are you on Kaggle?).")
 
-        if files:
-            image_files = [f for f in files if f.endswith(('.jpg', '.jpeg', '.png', '.tif', '.tiff'))]
-            print(f"  Files: {len(files)} total, {len(image_files)} images")
+    candidates = sorted(glob.glob(os.path.join(base, "*")))
+    # Heuristic: folder name contains luc/forgery/recod
+    key = re.compile(r"(luc|forg|recod|scientific)", re.IGNORECASE)
+    scored = []
+    for c in candidates:
+        name = os.path.basename(c)
+        score = 0
+        if key.search(name): score += 5
+        # presence of csv/images inside
+        if glob.glob(os.path.join(c, "**", "*.csv"), recursive=True): score += 2
+        if glob.glob(os.path.join(c, "**", "*.png"), recursive=True): score += 2
+        if glob.glob(os.path.join(c, "**", "*.jpg"), recursive=True): score += 2
+        scored.append((score, c))
+    scored.sort(reverse=True, key=lambda x: x[0])
+    best = scored[0][1] if scored else base
+    print("Auto-selected input root:", best, "score=", scored[0][0] if scored else None)
+    return best
 
-print("="*80)
-print("SYSTEM INFORMATION")
-print("="*80)
-print(f"Device: {CFG.DEVICE}")
-if CFG.DEVICE == 'cuda':
-    print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+COMP_ROOT = find_comp_root()
+print("COMP_ROOT =", COMP_ROOT)
+list_dir(COMP_ROOT, max_items=80)
 
-print("\n" + "="*80)
-print("VERIFYING DATA PATHS")
-print("="*80)
-verify_path(CFG.TRAIN_IMG_DIR, "TRAIN IMAGES")
-verify_path(CFG.TRAIN_MASK_DIR, "TRAIN MASKS")
-verify_path(CFG.TEST_IMG_DIR, "TEST IMAGES")
-print("="*80 + "\n")
+def discover_files(root: str) -> Dict[str, str]:
+    out = {}
 
-# ============================================================================
-# DATASET AND AUGMENTATION
-# ============================================================================
+    # CSVs
+    csvs = glob.glob(os.path.join(root, "**", "*.csv"), recursive=True)
+    csvs = sorted(csvs)
+
+    # Prefer sample_submission
+    sample = None
+    for c in csvs:
+        if "sample_submission" in os.path.basename(c).lower():
+            sample = c
+            break
+    if sample is None and csvs:
+        # guess: file with "submission" in name
+        for c in csvs:
+            if "submission" in os.path.basename(c).lower():
+                sample = c
+                break
+    out["sample_csv"] = sample or ""
+
+    # Try to find train csv: often train.csv or metadata/labels
+    train_csv = None
+    for c in csvs:
+        bn = os.path.basename(c).lower()
+        if bn in ("train.csv", "training.csv", "train_labels.csv", "labels.csv"):
+            train_csv = c
+            break
+    if train_csv is None:
+        # heuristic: csv with many rows and at least 2 columns
+        best = None
+        best_rows = -1
+        for c in csvs:
+            try:
+                df0 = pd.read_csv(c, nrows=100)
+                if df0.shape[1] >= 2:
+                    # read just line count-ish cheaply: not perfect, but ok
+                    rows = sum(1 for _ in open(c, "rb"))  # includes header
+                    if rows > best_rows:
+                        best_rows = rows
+                        best = c
+            except Exception:
+                continue
+        train_csv = best
+    out["train_csv"] = train_csv or ""
+
+    # Images folders: look for dirs containing many image files
+    img_exts = ("*.png","*.jpg","*.jpeg","*.tif","*.tiff","*.bmp")
+    all_imgs = []
+    for ext in img_exts:
+        all_imgs += glob.glob(os.path.join(root, "**", ext), recursive=True)
+    all_imgs = sorted(all_imgs)
+
+    # Group by parent folder
+    from collections import Counter
+    parent_counts = Counter([os.path.dirname(p) for p in all_imgs])
+    common_parents = [p for p,_ in parent_counts.most_common(50)]
+
+    # Heuristics for train/test/mask dirs
+    def pick_dir(keys: List[str]) -> str:
+        keys = [k.lower() for k in keys]
+        for p in common_parents:
+            low = os.path.basename(p).lower()
+            if any(k in low for k in keys):
+                return p
+        # fallback: deepest folder with many images
+        return common_parents[0] if common_parents else ""
+
+    out["train_img_dir"] = pick_dir(["train_images","train","images_train","training_images","image_train"])
+    out["test_img_dir"]  = pick_dir(["test_images","test","images_test","testing_images","image_test"])
+    out["mask_dir"]      = pick_dir(["masks","mask","train_masks","labels","gt","groundtruth"])
+
+    return out
+
+paths = discover_files(COMP_ROOT)
+print(json.dumps(paths, indent=2))
+
+# Load sample_submission if present (to learn required columns)
+sample_sub = None
+if paths["sample_csv"] and os.path.exists(paths["sample_csv"]):
+    sample_sub = pd.read_csv(paths["sample_csv"])
+    print("sample_submission head:")
+    print(sample_sub.head())
+else:
+    print("No sample_submission found by name. We'll infer submission columns later.")
+
+# Load train csv if present
+train_df = None
+if paths["train_csv"] and os.path.exists(paths["train_csv"]):
+    train_df = pd.read_csv(paths["train_csv"])
+    print("train_csv =", paths["train_csv"])
+    print("train_df shape:", train_df.shape)
+    print(train_df.head())
+else:
+    print("No train csv found. We'll attempt to build from folders (img<->mask name matching).")
+
+# If train_df missing, attempt folder-based pairing
+def build_df_from_folders(train_img_dir: str, mask_dir: str) -> pd.DataFrame:
+    img_paths = []
+    for ext in ("*.png","*.jpg","*.jpeg","*.tif","*.tiff","*.bmp"):
+        img_paths += glob.glob(os.path.join(train_img_dir, ext))
+    img_paths = sorted(img_paths)
+    if not img_paths:
+        raise FileNotFoundError("No training images found in detected train_img_dir.")
+    rows = []
+    for ip in img_paths:
+        fn = os.path.basename(ip)
+        stem = os.path.splitext(fn)[0]
+        # find mask with same stem
+        mp = None
+        for ext in (".png",".jpg",".jpeg",".tif",".tiff",".bmp"):
+            cand = os.path.join(mask_dir, stem + ext)
+            if os.path.exists(cand):
+                mp = cand
+                break
+        rows.append({"image_path": ip, "mask_path": mp or ""})
+    return pd.DataFrame(rows)
+
+if train_df is None:
+    if paths["train_img_dir"] and paths["mask_dir"] and os.path.exists(paths["train_img_dir"]) and os.path.exists(paths["mask_dir"]):
+        train_df = build_df_from_folders(paths["train_img_dir"], paths["mask_dir"])
+        print("Built train_df from folders:", train_df.shape)
+        print(train_df.head())
+    else:
+        raise RuntimeError("Could not detect training data layout (train csv or train/mask folders).")
+
+# Identify ID column & image path column, RLE column, etc.
+def infer_columns(df: pd.DataFrame) -> Dict[str, Optional[str]]:
+    cols = [c.lower() for c in df.columns]
+    out = {"id": None, "image": None, "mask": None, "rle": None}
+
+    # id-like
+    for c in df.columns:
+        cl = c.lower()
+        if cl in ("id","image_id","img_id","filename","file_name","image_name"):
+            out["id"] = c; break
+    if out["id"] is None:
+        # fallback: first column
+        out["id"] = df.columns[0]
+
+    # image path / filename
+    for c in df.columns:
+        cl = c.lower()
+        if any(k in cl for k in ("image_path","img_path","image","img","file")):
+            out["image"] = c
+            break
+
+    # mask path
+    for c in df.columns:
+        cl = c.lower()
+        if any(k in cl for k in ("mask_path","mask","label_path","gt_path","groundtruth")):
+            out["mask"] = c
+            break
+
+    # rle
+    for c in df.columns:
+        cl = c.lower()
+        if "rle" in cl or "encoded" in cl:
+            out["rle"] = c
+            break
+
+    return out
+
+colmap = infer_columns(train_df)
+print("Inferred columns:", colmap)
+
+# Build absolute paths if CSV contains filenames only
+def make_abs_path_maybe(p: str, base_dir: str) -> str:
+    if not isinstance(p, str): return ""
+    if p == "": return ""
+    if os.path.isabs(p) and os.path.exists(p): return p
+    cand = os.path.join(base_dir, p)
+    return cand if os.path.exists(cand) else p
+
+# If image column exists and looks like filename, attach base dir
+if colmap["image"] is not None and paths["train_img_dir"]:
+    train_df["__img_path__"] = train_df[colmap["image"]].apply(lambda x: make_abs_path_maybe(str(x), paths["train_img_dir"]))
+elif "image_path" in train_df.columns:
+    train_df["__img_path__"] = train_df["image_path"]
+else:
+    # try to map from id to file in train_img_dir
+    id_col = colmap["id"]
+    if paths["train_img_dir"]:
+        def id_to_path(x):
+            x = str(x)
+            for ext in (".png",".jpg",".jpeg",".tif",".tiff",".bmp"):
+                cand = os.path.join(paths["train_img_dir"], x + ext)
+                if os.path.exists(cand): return cand
+            # maybe already has extension
+            cand = os.path.join(paths["train_img_dir"], x)
+            return cand if os.path.exists(cand) else ""
+        train_df["__img_path__"] = train_df[id_col].apply(id_to_path)
+
+# mask path
+if colmap["mask"] is not None and paths["mask_dir"]:
+    train_df["__mask_path__"] = train_df[colmap["mask"]].apply(lambda x: make_abs_path_maybe(str(x), paths["mask_dir"]))
+elif "mask_path" in train_df.columns:
+    train_df["__mask_path__"] = train_df["mask_path"]
+else:
+    train_df["__mask_path__"] = ""
+
+# RLE
+if colmap["rle"] is not None:
+    train_df["__rle__"] = train_df[colmap["rle"]].astype(str)
+else:
+    train_df["__rle__"] = ""
+
+# Optionally debug subset
+if CFG.debug:
+    train_df = train_df.sample(min(CFG.debug_n, len(train_df)), random_state=CFG.seed).reset_index(drop=True)
+
+print("Prepared train_df:", train_df.shape)
+print(train_df.head())
+
+
+# %% [markdown]
+# ## [Cell 3] Dataset Class (lazy load + supports mask files OR RLE)
+
+# %% [code]
+def read_image_rgb(path: str) -> np.ndarray:
+    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise FileNotFoundError(f"Image not found: {path}")
+    # Handle grayscale
+    if img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+    # Handle BGRA
+    if img.shape[-1] == 4:
+        img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    return img
+
+def read_mask_bin(path: str, target_shape: Optional[Tuple[int,int]] = None) -> np.ndarray:
+    m = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    if m is None:
+        return None
+    if target_shape is not None and (m.shape[0] != target_shape[0] or m.shape[1] != target_shape[1]):
+        m = cv2.resize(m, (target_shape[1], target_shape[0]), interpolation=cv2.INTER_NEAREST)
+    m = (m > 127).astype(np.uint8)
+    return m
+
+# RLE (Kaggle standard: run-length on flattened pixels, usually column-major for some comps.
+# We will implement both possibilities and auto-detect by matching shape if needed.
+def rle_decode(rle: str, shape: Tuple[int,int], order: str = "F") -> np.ndarray:
+    if rle is None or rle == "" or rle.lower() == "nan":
+        return np.zeros(shape, dtype=np.uint8)
+    s = rle.strip().split()
+    starts, lengths = [np.asarray(x, dtype=int) for x in (s[0::2], s[1::2])]
+    starts -= 1
+    ends = starts + lengths
+    img = np.zeros(shape[0]*shape[1], dtype=np.uint8)
+    for lo, hi in zip(starts, ends):
+        img[lo:hi] = 1
+    if order.upper() == "F":
+        return img.reshape((shape[1], shape[0])).T  # Fortran-like
+    else:
+        return img.reshape(shape)
+
+def rle_encode(mask: np.ndarray, order: str = "F") -> str:
+    # mask: HxW binary {0,1}
+    if mask is None:
+        return ""
+    mask = mask.astype(np.uint8)
+    if order.upper() == "F":
+        pixels = mask.T.flatten()
+    else:
+        pixels = mask.flatten()
+    pixels = np.concatenate([[0], pixels, [0]])
+    runs = np.where(pixels[1:] != pixels[:-1])[0] + 1
+    runs[1::2] -= runs[::2]
+    if len(runs) == 0:
+        return ""
+    return " ".join(str(x) for x in runs)
 
 class ScientificForgeryDataset(Dataset):
-    """
-    Dataset for scientific image forgery detection.
-    Automatically searches for images in subfolders (e.g., authentic/, forged/).
-    """
-
-    def __init__(self, image_dir, mask_dir=None, transform=None, mode='train'):
-        self.image_dir = image_dir
-        self.mask_dir = mask_dir
-        self.transform = transform
+    def __init__(self, df: pd.DataFrame, img_size: int, augment=None, mode: str = "train"):
+        self.df = df.reset_index(drop=True)
+        self.img_size = img_size
+        self.augment = augment
         self.mode = mode
 
-        # Find all image files including those in subfolders
-        self.image_files = []
-
-        # First, search directly in the directory
-        try:
-            direct_files = [f for f in os.listdir(image_dir)
-                          if os.path.isfile(os.path.join(image_dir, f))
-                          and f.endswith(('.jpg', '.jpeg', '.png', '.tif', '.tiff'))]
-            self.image_files.extend(direct_files)
-        except:
-            pass
-
-        # Then, search in subdirectories
-        for root, dirs, files in os.walk(image_dir):
-            for file in files:
-                if file.endswith(('.jpg', '.jpeg', '.png', '.tif', '.tiff')):
-                    full_path = os.path.join(root, file)
-                    rel_path = os.path.relpath(full_path, image_dir)
-
-                    # Store relative path (for subfolder structure)
-                    if rel_path not in self.image_files and file not in self.image_files:
-                        self.image_files.append(rel_path)
-
-        self.image_files = sorted(self.image_files)
-        print(f"{mode.upper()}: {len(self.image_files)} images found")
-
-        if len(self.image_files) == 0:
-            print(f"⚠️  WARNING: No images found in {image_dir}")
-            print("Please check if the path is correct!")
-
-    def __len__(self):
-        return len(self.image_files)
+    def __len__(self): return len(self.df)
 
     def __getitem__(self, idx):
-        # Build image path
-        img_rel_path = self.image_files[idx]
-        img_path = os.path.join(self.image_dir, img_rel_path)
+        row = self.df.iloc[idx]
+        img_path = row["__img_path__"]
+        img = read_image_rgb(img_path)
+        h0, w0 = img.shape[:2]
 
-        # Read image
-        image = cv2.imread(img_path)
-        if image is None:
-            print(f"ERROR: Cannot read image: {img_path}")
-            # Return empty image to prevent crash
-            image = np.zeros((256, 256, 3), dtype=np.uint8)
-        else:
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        # Load mask (file or RLE) for train/valid
+        mask = None
+        if self.mode != "test":
+            if isinstance(row.get("__mask_path__", ""), str) and row["__mask_path__"] and os.path.exists(row["__mask_path__"]):
+                mask = read_mask_bin(row["__mask_path__"], target_shape=(h0,w0))
+            else:
+                rle = row.get("__rle__", "")
+                # decode with best-guess ordering (F is common for Kaggle segmentation)
+                mask = rle_decode(rle, (h0,w0), order="F")
 
-        if self.mode == 'test':
-            if self.transform:
-                augmented = self.transform(image=image)
-                image = augmented['image']
-            # Return just filename (without subfolder path)
-            filename = os.path.basename(img_rel_path)
-            return image, filename
+        # Resize via Albumentations (RandomResizedCrop etc.). If no augment, do simple resize + normalize.
+        if self.augment is not None:
+            if mask is None:
+                augmented = self.augment(image=img)
+                img_t = augmented["image"]
+                return {"image": img_t, "id": str(row[colmap["id"]]) if colmap["id"] in row else str(idx)}
+            else:
+                augmented = self.augment(image=img, mask=mask)
+                img_t = augmented["image"]
+                mask_t = augmented["mask"].float().unsqueeze(0)  # 1xHxW
+                return {"image": img_t, "mask": mask_t, "id": str(row[colmap["id"]]) if colmap["id"] in row else str(idx)}
 
-        # Find corresponding mask file
-        img_filename = os.path.basename(img_rel_path)
-        mask_filename = os.path.splitext(img_filename)[0] + '.png'
-        mask_path = os.path.join(self.mask_dir, mask_filename)
+        # Fallback basic
+        img = cv2.resize(img, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR)
+        img = img.astype(np.float32) / 255.0
+        img = (img - np.array([0.485,0.456,0.406], dtype=np.float32)) / np.array([0.229,0.224,0.225], dtype=np.float32)
+        img = torch.from_numpy(img).permute(2,0,1)
 
-        if os.path.exists(mask_path):
-            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-        else:
-            # Create empty mask if not found
-            mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
-
-        mask = (mask > 127).astype(np.float32)
-
-        if self.transform:
-            augmented = self.transform(image=image, mask=mask)
-            image = augmented['image']
-            mask = augmented['mask']
-
-        return image, mask
+        if mask is None:
+            return {"image": img, "id": str(row[colmap["id"]]) if colmap["id"] in row else str(idx)}
+        mask = cv2.resize(mask, (self.img_size, self.img_size), interpolation=cv2.INTER_NEAREST)
+        mask = torch.from_numpy(mask.astype(np.float32)).unsqueeze(0)
+        return {"image": img, "mask": mask, "id": str(row[colmap["id"]]) if colmap["id"] in row else str(idx)}
 
 
-def get_train_transforms(img_size=384):
-    """Get training augmentation transforms."""
+# %% [markdown]
+# ## [Cell 4] Augmentations (heavy + domain-specific)
+
+# %% [code]
+def get_train_aug(img_size: int):
     return A.Compose([
-        A.Resize(img_size, img_size),
+        A.RandomResizedCrop(img_size, img_size, scale=(0.8, 1.0)),
         A.HorizontalFlip(p=0.5),
         A.VerticalFlip(p=0.5),
         A.RandomRotate90(p=0.5),
-        A.ShiftScaleRotate(shift_limit=0.0625, scale_limit=0.1, rotate_limit=15, p=0.5),
+        A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.15, rotate_limit=30, p=0.8, border_mode=cv2.BORDER_REFLECT_101),
         A.OneOf([
-            A.GaussNoise(var_limit=(10.0, 50.0)),
-            A.GaussianBlur(),
-            A.MotionBlur(),
-        ], p=0.3),
-        A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.3),
-        A.ImageCompression(quality_lower=70, quality_upper=100, p=0.3),
-        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            A.GaussNoise(var_limit=(10, 50)),
+            A.GaussianBlur(blur_limit=(3, 7)),
+            A.MotionBlur(blur_limit=7),
+        ], p=0.4),
+        A.RandomBrightnessContrast(0.2, 0.2, p=0.4),
+        A.ImageCompression(quality_lower=60, quality_upper=100, p=0.3),
+        A.CLAHE(p=0.3),
+        A.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]),
         ToTensorV2(),
     ])
 
-
-def get_val_transforms(img_size=384):
-    """Get validation transforms."""
+def get_valid_aug(img_size: int):
     return A.Compose([
         A.Resize(img_size, img_size),
-        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        A.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]),
         ToTensorV2(),
     ])
 
-# ============================================================================
-# LOSS FUNCTIONS
-# ============================================================================
 
+# %% [markdown]
+# ## [Cell 5] Model Definitions (3 architectures)
+
+# %% [code]
+def try_create_model(arch: str, encoder: str):
+    # If imagenet weights can't be downloaded (offline), fallback to None
+    for weights in ["imagenet", None]:
+        try:
+            if arch == "unet":
+                m = smp.Unet(encoder_name=encoder, encoder_weights=weights, in_channels=3, classes=1, activation=None)
+            elif arch == "unetpp":
+                m = smp.UnetPlusPlus(encoder_name=encoder, encoder_weights=weights, in_channels=3, classes=1, activation=None)
+            elif arch == "deeplabv3p":
+                m = smp.DeepLabV3Plus(encoder_name=encoder, encoder_weights=weights, in_channels=3, classes=1, activation=None)
+            else:
+                raise ValueError("Unknown arch")
+            if weights is None:
+                print(f"[Model] {arch}+{encoder}: encoder_weights=None (offline-safe)")
+            else:
+                print(f"[Model] {arch}+{encoder}: encoder_weights='imagenet'")
+            return m
+        except Exception as e:
+            print(f"Failed creating {arch}+{encoder} with weights={weights}: {type(e).__name__}: {e}")
+            continue
+    raise RuntimeError(f"Could not create model: {arch}+{encoder}")
+
+def enable_grad_checkpointing(model):
+    # Best-effort: some timm backbones expose this
+    if not CFG.enable_grad_checkpointing:
+        return
+    try:
+        if hasattr(model, "encoder") and hasattr(model.encoder, "set_grad_checkpointing"):
+            model.encoder.set_grad_checkpointing(True)
+            print("Enabled encoder grad checkpointing.")
+        # some models expose .set_grad_checkpointing
+        if hasattr(model, "set_grad_checkpointing"):
+            model.set_grad_checkpointing(True)
+            print("Enabled model grad checkpointing.")
+    except Exception as e:
+        print("Grad checkpointing not supported / failed:", e)
+
+def build_models():
+    # Required by spec
+    m1 = try_create_model("unet", "efficientnet-b4")
+    m2 = try_create_model("unetpp", "resnet101")
+    m3 = try_create_model("deeplabv3p", "efficientnet-b3")
+    for m in (m1,m2,m3):
+        enable_grad_checkpointing(m)
+    return [m1, m2, m3]
+
+
+# %% [markdown]
+# ## [Cell 6] Loss Functions (0.4*BCE + 0.3*Dice + 0.3*Focal) with adaptive weighting
+
+# %% [code]
 class DiceLoss(nn.Module):
-    """Dice Loss for segmentation."""
-
-    def __init__(self, smooth=1e-6):
+    def __init__(self, eps=1e-6):
         super().__init__()
-        self.smooth = smooth
+        self.eps = eps
+    def forward(self, logits, targets):
+        probs = torch.sigmoid(logits)
+        targets = targets.float()
+        dims = (0,2,3)
+        num = 2*(probs*targets).sum(dims)
+        den = (probs+targets).sum(dims) + self.eps
+        dice = 1 - (num/den)
+        return dice.mean()
 
-    def forward(self, pred, target):
-        pred = torch.sigmoid(pred)
-        pred_flat = pred.view(pred.size(0), -1)
-        target_flat = target.view(target.size(0), -1)
-
-        intersection = (pred_flat * target_flat).sum(dim=1)
-        dice = (2. * intersection + self.smooth) / (
-            pred_flat.sum(dim=1) + target_flat.sum(dim=1) + self.smooth
-        )
-
-        return 1 - dice.mean()
-
-
-class CombinedLoss(nn.Module):
-    """Combined BCE + Dice Loss."""
-
-    def __init__(self, bce_weight=0.5, dice_weight=0.5):
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.8, gamma=2.0, eps=1e-6):
         super().__init__()
-        self.bce_weight = bce_weight
-        self.dice_weight = dice_weight
-        self.bce = nn.BCEWithLogitsLoss()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.eps = eps
+    def forward(self, logits, targets):
+        targets = targets.float()
+        bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+        p = torch.sigmoid(logits)
+        p_t = p*targets + (1-p)*(1-targets)
+        focal = (self.alpha*(1-p_t).pow(self.gamma) * bce)
+        return focal.mean()
+
+class AdaptiveComboLoss(nn.Module):
+    def __init__(self, init_pos_weight=3.0):
+        super().__init__()
+        self.register_buffer("pos_weight", torch.tensor([init_pos_weight], dtype=torch.float32))
         self.dice = DiceLoss()
+        self.focal = FocalLoss()
+        self.momentum = 0.95  # moving avg
+    @torch.no_grad()
+    def update_pos_weight(self, targets):
+        # targets: (B,1,H,W)
+        # Estimate foreground ratio and update pos_weight
+        fg = targets.float().mean().clamp(1e-6, 1-1e-6).item()
+        new_pw = (1 - fg) / fg
+        new_pw = float(np.clip(new_pw, 1.0, 30.0))
+        cur = self.pos_weight.item()
+        updated = self.momentum*cur + (1-self.momentum)*new_pw
+        self.pos_weight[:] = updated
 
-    def forward(self, pred, target):
-        bce_loss = self.bce(pred, target)
-        dice_loss = self.dice(pred, target)
-        return self.bce_weight * bce_loss + self.dice_weight * dice_loss
+    def forward(self, logits, targets):
+        self.update_pos_weight(targets)
+        bce = F.binary_cross_entropy_with_logits(logits, targets.float(), pos_weight=self.pos_weight.to(logits.device))
+        dice = self.dice(logits, targets)
+        focal = self.focal(logits, targets)
+        return 0.4*bce + 0.3*dice + 0.3*focal
 
-# ============================================================================
-# MODEL
-# ============================================================================
 
-def create_model(encoder_name='efficientnet-b2', encoder_weights='imagenet'):
-    """Create U-Net model."""
-    model = smp.Unet(
-        encoder_name=encoder_name,
-        encoder_weights=encoder_weights,
-        in_channels=3,
-        classes=1,
-        activation=None,
+# %% [markdown]
+# ## [Cell 7] Training Loop (AMP FP16 + cosine warm restarts + early stopping)
+
+# %% [code]
+@torch.no_grad()
+def compute_metrics_from_logits(logits, targets, thr=0.5, eps=1e-7):
+    probs = torch.sigmoid(logits)
+    preds = (probs > thr).float()
+    targets = targets.float()
+
+    tp = (preds*targets).sum().item()
+    fp = (preds*(1-targets)).sum().item()
+    fn = ((1-preds)*targets).sum().item()
+
+    f1 = (2*tp) / (2*tp + fp + fn + eps)
+    iou = tp / (tp + fp + fn + eps)
+    return f1, iou
+
+def train_one_epoch(model, loader, optimizer, scaler, loss_fn, scheduler=None):
+    model.train()
+    running_loss = 0.0
+    optimizer.zero_grad(set_to_none=True)
+
+    pbar = tqdm(loader, leave=False)
+    for step, batch in enumerate(pbar):
+        imgs = batch["image"].to(device, non_blocking=True)
+        masks = batch["mask"].to(device, non_blocking=True)
+
+        with torch.cuda.amp.autocast(enabled=CFG.use_amp):
+            logits = model(imgs)
+            loss = loss_fn(logits, masks)
+            loss = loss / CFG.accumulation_steps
+
+        scaler.scale(loss).backward()
+
+        if (step + 1) % CFG.accumulation_steps == 0:
+            if CFG.grad_clip is not None:
+                scaler.unscale_(optimizer)
+                nn.utils.clip_grad_norm_(model.parameters(), CFG.grad_clip)
+
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+
+            if scheduler is not None:
+                scheduler.step()
+
+        running_loss += loss.item() * CFG.accumulation_steps
+        pbar.set_postfix(loss=running_loss/(step+1))
+
+    return running_loss / max(1, len(loader))
+
+@torch.no_grad()
+def validate(model, loader, thr=0.5):
+    model.eval()
+    losses = []
+    f1s, ious = [], []
+    loss_fn_val = AdaptiveComboLoss(init_pos_weight=3.0).to(device)  # separate for eval loss display
+
+    for batch in tqdm(loader, leave=False):
+        imgs = batch["image"].to(device, non_blocking=True)
+        masks = batch["mask"].to(device, non_blocking=True)
+        with torch.cuda.amp.autocast(enabled=CFG.use_amp):
+            logits = model(imgs)
+            loss = loss_fn_val(logits, masks)
+        f1, iou = compute_metrics_from_logits(logits, masks, thr=thr)
+        losses.append(loss.item())
+        f1s.append(f1)
+        ious.append(iou)
+
+    return float(np.mean(losses)), float(np.mean(f1s)), float(np.mean(ious))
+
+def cleanup_cuda():
+    torch.cuda.empty_cache()
+    gc.collect()
+
+def fit_model_for_fold(model, fold:int, train_idx, val_idx, img_size:int, stage_name:str,
+                       df: pd.DataFrame, best_path: str, start_time: float):
+    train_ds = ScientificForgeryDataset(df.iloc[train_idx], img_size=img_size, augment=get_train_aug(img_size), mode="train")
+    val_ds   = ScientificForgeryDataset(df.iloc[val_idx],   img_size=img_size, augment=get_valid_aug(img_size), mode="valid")
+
+    train_loader = DataLoader(train_ds, batch_size=CFG.batch_size, shuffle=True,
+                              num_workers=CFG.num_workers, pin_memory=CFG.pin_memory, drop_last=True)
+    val_loader   = DataLoader(val_ds, batch_size=max(1, CFG.batch_size//2), shuffle=False,
+                              num_workers=CFG.num_workers, pin_memory=CFG.pin_memory, drop_last=False)
+
+    model = model.to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=CFG.lr, weight_decay=CFG.weight_decay)
+
+    # Cosine annealing warm restarts per update step (batch-level stepping)
+    steps_per_epoch = max(1, len(train_loader)//CFG.accumulation_steps)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=max(1, CFG.t_max_restart*steps_per_epoch), T_mult=1, eta_min=1e-6
     )
-    return model
 
-# ============================================================================
-# TRAINING
-# ============================================================================
+    scaler = torch.cuda.amp.GradScaler(enabled=CFG.use_amp)
+    loss_fn = AdaptiveComboLoss(init_pos_weight=3.0).to(device)
 
-class Trainer:
-    """Trainer class for model training."""
+    best_f1 = -1.0
+    best_thr = CFG.default_thr
+    bad_epochs = 0
 
-    def __init__(self, model, train_loader, val_loader, criterion, optimizer,
-                 scheduler, device, num_epochs, checkpoint_dir):
-        self.model = model.to(device)
-        self.train_loader = train_loader
-        self.val_loader = val_loader
-        self.criterion = criterion
-        self.optimizer = optimizer
-        self.scheduler = scheduler
-        self.device = device
-        self.num_epochs = num_epochs
-        self.checkpoint_dir = checkpoint_dir
+    # stage epochs
+    stage_epochs = {
+        "256": CFG.max_epochs_per_stage[0],
+        "384": CFG.max_epochs_per_stage[1],
+        "512": CFG.max_epochs_per_stage[2],
+    }[stage_name]
 
-        self.scaler = torch.cuda.amp.GradScaler() if CFG.MIXED_PRECISION else None
+    for epoch in range(stage_epochs):
+        # Time guard per fold
+        elapsed_min = (time.time() - start_time) / 60.0
+        if elapsed_min > CFG.fold_time_limit_minutes:
+            print(f"[Fold {fold}] Time limit reached ({elapsed_min:.1f} min). Stopping stage.")
+            break
 
-        self.best_iou = 0
-        self.best_f1 = 0
-        self.patience_counter = 0
+        tr_loss = train_one_epoch(model, train_loader, optimizer, scaler, loss_fn, scheduler=scheduler)
 
-        self.history = {
-            'train_loss': [], 'val_loss': [], 'val_f1': [],
-            'val_iou': [], 'val_precision': [], 'val_recall': []
-        }
+        # Try a few thresholds quickly (optional)
+        thr_candidates = [0.35, 0.45, 0.50, 0.55, 0.60]
+        best_epoch_f1, best_epoch_iou, best_epoch_thr, best_epoch_loss = -1, -1, None, None
+        for thr in thr_candidates:
+            va_loss, va_f1, va_iou = validate(model, val_loader, thr=thr)
+            if va_f1 > best_epoch_f1:
+                best_epoch_f1, best_epoch_iou, best_epoch_thr, best_epoch_loss = va_f1, va_iou, thr, va_loss
 
-    def train_epoch(self, epoch):
-        """Train for one epoch."""
-        self.model.train()
-        total_loss = 0
+        print(f"[Fold {fold} | {stage_name}] Epoch {epoch+1}/{stage_epochs} "
+              f"train_loss={tr_loss:.4f} val_loss={best_epoch_loss:.4f} val_f1={best_epoch_f1:.4f} val_iou={best_epoch_iou:.4f} thr={best_epoch_thr}")
 
-        pbar = tqdm(self.train_loader, desc=f'Epoch {epoch+1}/{self.num_epochs} [Train]')
-        for images, masks in pbar:
-            images = images.to(self.device)
-            masks = masks.to(self.device).unsqueeze(1)
-
-            self.optimizer.zero_grad()
-
-            if CFG.MIXED_PRECISION:
-                with torch.cuda.amp.autocast():
-                    outputs = self.model(images)
-                    loss = self.criterion(outputs, masks)
-                self.scaler.scale(loss).backward()
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                outputs = self.model(images)
-                loss = self.criterion(outputs, masks)
-                loss.backward()
-                self.optimizer.step()
-
-            total_loss += loss.item()
-            pbar.set_postfix({'loss': loss.item()})
-
-        return total_loss / len(self.train_loader)
-
-    def validate(self, epoch):
-        """Validate the model."""
-        self.model.eval()
-        total_loss = 0
-        all_preds = []
-        all_targets = []
-
-        with torch.no_grad():
-            pbar = tqdm(self.val_loader, desc=f'Epoch {epoch+1}/{self.num_epochs} [Val]')
-            for images, masks in pbar:
-                images = images.to(self.device)
-                masks = masks.to(self.device).unsqueeze(1)
-
-                outputs = self.model(images)
-                loss = self.criterion(outputs, masks)
-                total_loss += loss.item()
-
-                preds = torch.sigmoid(outputs) > 0.5
-                all_preds.append(preds.cpu().numpy())
-                all_targets.append(masks.cpu().numpy())
-
-        all_preds = np.concatenate(all_preds).flatten()
-        all_targets = np.concatenate(all_targets).flatten()
-
-        metrics = {
-            'loss': total_loss / len(self.val_loader),
-            'f1': f1_score(all_targets, all_preds, zero_division=0),
-            'iou': jaccard_score(all_targets, all_preds, zero_division=0),
-            'precision': precision_score(all_targets, all_preds, zero_division=0),
-            'recall': recall_score(all_targets, all_preds, zero_division=0)
-        }
-
-        return metrics
-
-    def train(self):
-        """Main training loop."""
-        print(f"Training for {self.num_epochs} epochs...")
-
-        for epoch in range(self.num_epochs):
-            train_loss = self.train_epoch(epoch)
-            val_metrics = self.validate(epoch)
-
-            if self.scheduler:
-                self.scheduler.step()
-
-            self.history['train_loss'].append(train_loss)
-            self.history['val_loss'].append(val_metrics['loss'])
-            self.history['val_f1'].append(val_metrics['f1'])
-            self.history['val_iou'].append(val_metrics['iou'])
-            self.history['val_precision'].append(val_metrics['precision'])
-            self.history['val_recall'].append(val_metrics['recall'])
-
-            print(f"\nEpoch {epoch+1}/{self.num_epochs}")
-            print(f"Train Loss: {train_loss:.4f}")
-            print(f"Val Loss: {val_metrics['loss']:.4f} | F1: {val_metrics['f1']:.4f} | IoU: {val_metrics['iou']:.4f}")
-
-            if val_metrics['iou'] > self.best_iou:
-                self.best_iou = val_metrics['iou']
-                torch.save(self.model.state_dict(),
-                          os.path.join(self.checkpoint_dir, 'best_iou.pth'))
-                self.patience_counter = 0
-                print(f"✓ New best IoU: {self.best_iou:.4f}")
-            else:
-                self.patience_counter += 1
-
-            if self.patience_counter >= CFG.EARLY_STOPPING_PATIENCE:
-                print(f"\nEarly stopping at epoch {epoch+1}")
+        if best_epoch_f1 > best_f1:
+            best_f1 = best_epoch_f1
+            best_thr = best_epoch_thr
+            bad_epochs = 0
+            torch.save({"model": model.state_dict(), "best_thr": best_thr}, best_path)
+            print("  ✔ saved:", best_path)
+        else:
+            bad_epochs += 1
+            if bad_epochs >= CFG.early_stop_patience:
+                print("  ⏹ early stopping.")
                 break
 
-        return self.history
+        cleanup_cuda()
 
-# ============================================================================
-# INFERENCE
-# ============================================================================
+    # Load best for next stage
+    if os.path.exists(best_path):
+        ckpt = torch.load(best_path, map_location="cpu")
+        model.load_state_dict(ckpt["model"])
+        best_thr = float(ckpt.get("best_thr", CFG.default_thr))
 
-def post_process_mask(mask, min_area=100, kernel_size=5):
-    """Post-process segmentation mask."""
-    if mask.dtype != np.uint8:
-        mask = (mask * 255).astype(np.uint8)
-
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-    output_mask = np.zeros_like(mask)
-
-    for i in range(1, num_labels):
-        if stats[i, cv2.CC_STAT_AREA] >= min_area:
-            output_mask[labels == i] = 255
-
-    return output_mask
+    return model, best_thr
 
 
-def predict_test_set(model, test_loader, device, post_process=True):
-    """Predict on test set."""
-    model.eval()
-    predictions = []
-    filenames = []
+# %% [markdown]
+# ## [Cell 8] Cross-Validation Pipeline (5-fold + progressive resizing)
 
-    with torch.no_grad():
-        for images, fnames in tqdm(test_loader, desc='Predicting'):
-            images = images.to(device)
-            outputs = model(images)
-            preds = torch.sigmoid(outputs) > 0.5
-            masks = preds.squeeze().cpu().numpy()
+# %% [code]
+# Build folds
+kf = KFold(n_splits=CFG.num_folds, shuffle=True, random_state=CFG.seed)
+indices = np.arange(len(train_df))
 
-            if masks.ndim == 2:
-                masks = [masks]
+# 3 model specs as requested
+MODEL_SPECS = [
+    ("model1_unet_effb4",  "unet",      "efficientnet-b4"),
+    ("model2_unetpp_r101", "unetpp",    "resnet101"),
+    ("model3_dlv3p_effb3", "deeplabv3p","efficientnet-b3"),
+]
 
-            if post_process:
-                masks = [post_process_mask(m) for m in masks]
+# You can toggle training/inference:
+DO_TRAIN = True
 
-            predictions.extend(masks)
-            filenames.extend(fnames)
+# Where to save per-fold best weights per model+fold+stage (final stage used for inference)
+os.makedirs(CFG.save_dir, exist_ok=True)
 
-    return predictions, filenames
+fold_thresholds = {name: {} for (name,_,_) in MODEL_SPECS}
+
+if DO_TRAIN:
+    for model_name, arch, encoder in MODEL_SPECS:
+        print("\n" + "="*90)
+        print("Training:", model_name, f"({arch}+{encoder})")
+        print("="*90)
+
+        for fold, (tr_idx, va_idx) in enumerate(kf.split(indices)):
+            print("\n" + "-"*70)
+            print(f"{model_name} | Fold {fold}/{CFG.num_folds-1}")
+            print("-"*70)
+
+            start_time = time.time()
+            # Create model fresh per fold
+            model = try_create_model(arch, encoder)
+            enable_grad_checkpointing(model)
+
+            best_thr = CFG.default_thr
+
+            # Progressive resizing: 256 -> 384 -> 512
+            for stage_size, stage_name in zip(CFG.sizes, ("256","384","512")):
+                best_path = os.path.join(CFG.save_dir, f"best_{model_name}_fold{fold}_stage{stage_name}.pth")
+                # If continuing, load previous stage best into model
+                if stage_name != "256":
+                    prev_candidates = sorted(glob.glob(os.path.join(CFG.save_dir, f"best_{model_name}_fold{fold}_stage*.pth")))
+                    if prev_candidates:
+                        ckpt = torch.load(prev_candidates[-1], map_location="cpu")
+                        model.load_state_dict(ckpt["model"])
+                        best_thr = float(ckpt.get("best_thr", best_thr))
+                        print("Loaded previous stage:", prev_candidates[-1], "thr=", best_thr)
+
+                model, best_thr = fit_model_for_fold(
+                    model=model, fold=fold, train_idx=tr_idx, val_idx=va_idx,
+                    img_size=stage_size, stage_name=stage_name, df=train_df,
+                    best_path=best_path, start_time=start_time
+                )
+
+            fold_thresholds[model_name][fold] = best_thr
+
+            # Cleanup per fold
+            del model
+            cleanup_cuda()
+
+    # Save thresholds
+    with open(os.path.join(CFG.save_dir, "fold_thresholds.json"), "w") as f:
+        json.dump(fold_thresholds, f, indent=2)
+    print("Saved fold_thresholds.json")
+
+else:
+    # Load thresholds if exist
+    thr_path = os.path.join(CFG.save_dir, "fold_thresholds.json")
+    if os.path.exists(thr_path):
+        fold_thresholds = json.load(open(thr_path, "r"))
+        print("Loaded thresholds:", thr_path)
 
 
-def rle_encode(mask, fg_val=1):
-    """
-    Official RLE encoder for competition (JSON format).
-    Returns: "[start, length, start, length, ...]"
-    """
-    import json
-    # Transpose and flatten (column-major order)
-    dots = np.where(mask.T.flatten() == fg_val)[0]
+# %% [markdown]
+# ## [Cell 9] Inference + 6x TTA
 
-    run_lengths = []
-    prev = -2
-
-    for b in dots:
-        if b > prev + 1:
-            run_lengths.extend([int(b + 1), 0])  # 1-based indexing
-        run_lengths[-1] += 1
-        prev = b
-
-    return json.dumps(run_lengths)
-
-
-def is_authentic(mask, threshold=0.001):
-    """Check if mask is authentic (no significant forgery)."""
-    if mask is None:
-        return True
-    forgery_ratio = np.sum(mask > 0) / mask.size
-    return forgery_ratio < threshold
-
-
-def create_submission(predictions, filenames, output_path='submission.csv', threshold=0.001):
-    """
-    Create submission file in official competition format.
-
-    Format:
-        case_id,annotation
-        1,authentic
-        2,"[123, 4]"
-    """
-    submission_data = []
-
-    for pred, fname in tqdm(zip(predictions, filenames), desc='Creating submission'):
-        # Get case_id (remove file extension)
-        case_id = fname.rsplit('.', 1)[0]
-
-        # Convert to binary mask
-        mask_binary = (pred > 0).astype(np.uint8)
-
-        # Check if authentic or forged
-        if is_authentic(mask_binary, threshold=threshold):
-            annotation = 'authentic'
+# %% [code]
+# Build test dataframe from folders or sample_submission
+def build_test_df(paths: Dict[str,str], sample_sub: Optional[pd.DataFrame]) -> pd.DataFrame:
+    # If sample submission exists, use its id column and map to files
+    if sample_sub is not None and len(sample_sub) > 0:
+        id_col = sample_sub.columns[0]
+        df = sample_sub[[id_col]].copy()
+        df.rename(columns={id_col: "__id__"}, inplace=True)
+        if paths["test_img_dir"]:
+            def id_to_path(x):
+                x = str(x)
+                # try with and without extension
+                for ext in (".png",".jpg",".jpeg",".tif",".tiff",".bmp"):
+                    cand = os.path.join(paths["test_img_dir"], x + ext)
+                    if os.path.exists(cand): return cand
+                cand = os.path.join(paths["test_img_dir"], x)
+                return cand if os.path.exists(cand) else ""
+            df["__img_path__"] = df["__id__"].apply(id_to_path)
         else:
-            annotation = rle_encode(mask_binary, fg_val=1)
+            df["__img_path__"] = df["__id__"].astype(str)
+        return df
 
-        submission_data.append({'case_id': case_id, 'annotation': annotation})
+    # Otherwise scan test folder
+    test_dir = paths["test_img_dir"]
+    if not test_dir or not os.path.exists(test_dir):
+        # fallback: guess some folder in COMP_ROOT
+        test_dir = paths["train_img_dir"]
+        print("⚠️ test_img_dir not found; falling back to train_img_dir scanning for 'test'-like images.")
+    img_paths = []
+    for ext in ("*.png","*.jpg","*.jpeg","*.tif","*.tiff","*.bmp"):
+        img_paths += glob.glob(os.path.join(test_dir, ext))
+    img_paths = sorted(img_paths)
+    df = pd.DataFrame({"__img_path__": img_paths})
+    df["__id__"] = df["__img_path__"].apply(lambda p: os.path.splitext(os.path.basename(p))[0])
+    return df
 
-    # Create DataFrame with correct column order
-    df = pd.DataFrame(submission_data)
-    df = df[['case_id', 'annotation']]
-    df.to_csv(output_path, index=False)
+test_df = build_test_df(paths, sample_sub)
+if CFG.debug:
+    test_df = test_df.head(100).copy()
+print("test_df:", test_df.shape)
+print(test_df.head())
 
-    print(f"\n✓ Submission saved: {output_path}")
-    print(f"  Total: {len(df)} | Authentic: {sum(df['annotation'] == 'authentic')} | Forged: {sum(df['annotation'] != 'authentic')}")
+# Build tta helpers
+def apply_tta(img: torch.Tensor, mode: str) -> torch.Tensor:
+    # img: BxCxHxW
+    if mode == "original":
+        return img
+    if mode == "hflip":
+        return torch.flip(img, dims=[3])
+    if mode == "vflip":
+        return torch.flip(img, dims=[2])
+    if mode == "rot90":
+        return torch.rot90(img, k=1, dims=[2,3])
+    if mode == "rot180":
+        return torch.rot90(img, k=2, dims=[2,3])
+    if mode == "rot270":
+        return torch.rot90(img, k=3, dims=[2,3])
+    raise ValueError("Unknown TTA mode")
 
-# ============================================================================
-# MAIN EXECUTION
-# ============================================================================
+def undo_tta(mask: torch.Tensor, mode: str) -> torch.Tensor:
+    # mask: Bx1xHxW
+    if mode == "original":
+        return mask
+    if mode == "hflip":
+        return torch.flip(mask, dims=[3])
+    if mode == "vflip":
+        return torch.flip(mask, dims=[2])
+    if mode == "rot90":
+        return torch.rot90(mask, k=3, dims=[2,3])
+    if mode == "rot180":
+        return torch.rot90(mask, k=2, dims=[2,3])
+    if mode == "rot270":
+        return torch.rot90(mask, k=1, dims=[2,3])
+    raise ValueError("Unknown TTA mode")
 
-def main():
-    print("="*80)
-    print("SCIENTIFIC IMAGE FORGERY DETECTION")
-    print("="*80)
-
-    # ========== TRAINING ==========
-    print("\n[1/3] PREPARING DATA...")
-
-    full_dataset = ScientificForgeryDataset(
-        CFG.TRAIN_IMG_DIR, CFG.TRAIN_MASK_DIR,
-        transform=get_train_transforms(CFG.IMG_SIZE), mode='train'
-    )
-
-    train_size = int((1 - CFG.VAL_SPLIT) * len(full_dataset))
-    val_size = len(full_dataset) - train_size
-
-    train_dataset, val_dataset = random_split(
-        full_dataset, [train_size, val_size],
-        generator=torch.Generator().manual_seed(CFG.SEED)
-    )
-
-    # Update val transforms
-    val_dataset.dataset.transform = get_val_transforms(CFG.IMG_SIZE)
-
-    train_loader = DataLoader(train_dataset, batch_size=CFG.BATCH_SIZE,
-                              shuffle=True, num_workers=CFG.NUM_WORKERS, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=CFG.BATCH_SIZE,
-                           shuffle=False, num_workers=CFG.NUM_WORKERS, pin_memory=True)
-
-    print(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}")
-
-    # ========== MODEL ==========
-    print("\n[2/3] CREATING MODEL...")
-
-    model = create_model(CFG.ENCODER, CFG.PRETRAINED)
-    model = model.to(CFG.DEVICE)
-
-    criterion = CombinedLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=CFG.LEARNING_RATE,
-                           weight_decay=CFG.WEIGHT_DECAY)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CFG.NUM_EPOCHS)
-
-    # ========== TRAINING ==========
-    print("\n[3/3] TRAINING...")
-
-    trainer = Trainer(model, train_loader, val_loader, criterion, optimizer,
-                     scheduler, CFG.DEVICE, CFG.NUM_EPOCHS, CFG.CHECKPOINT_DIR)
-    history = trainer.train()
-
-    # ========== INFERENCE ==========
-    print("\n[4/4] INFERENCE...")
-
-    model.load_state_dict(torch.load(os.path.join(CFG.CHECKPOINT_DIR, 'best_iou.pth')))
+@torch.no_grad()
+def predict_model(model, loader, tta=True, tta_modes=CFG.tta_modes):
     model.eval()
+    preds = []
+    ids = []
+    for batch in tqdm(loader, leave=False):
+        imgs = batch["image"].to(device, non_blocking=True)
+        batch_ids = batch["id"]
 
-    test_dataset = ScientificForgeryDataset(
-        CFG.TEST_IMG_DIR, transform=get_val_transforms(CFG.IMG_SIZE), mode='test'
-    )
+        if not tta:
+            with torch.cuda.amp.autocast(enabled=CFG.use_amp):
+                logits = model(imgs)
+                prob = torch.sigmoid(logits).float()
+        else:
+            prob_acc = 0.0
+            for m in tta_modes:
+                x = apply_tta(imgs, m)
+                with torch.cuda.amp.autocast(enabled=CFG.use_amp):
+                    logits = model(x)
+                    p = torch.sigmoid(logits).float()
+                p = undo_tta(p, m)
+                prob_acc = prob_acc + p
+            prob = prob_acc / float(len(tta_modes))
 
-    if len(test_dataset) == 0:
-        print("\n⚠️  WARNING: No test images found!")
-        print("Skipping inference...")
-        print("\n" + "="*80)
-        print("TRAINING COMPLETED!")
-        print("="*80)
-        print(f"✓ Best IoU: {trainer.best_iou:.4f}")
-        return
+        preds.append(prob.detach().cpu())
+        ids.extend(list(batch_ids))
+    preds = torch.cat(preds, dim=0)  # Nx1xHxW
+    return ids, preds
 
-    test_loader = DataLoader(test_dataset, batch_size=CFG.BATCH_SIZE,
-                            shuffle=False, num_workers=CFG.NUM_WORKERS)
+# Test loader at final size (512)
+infer_size = CFG.sizes[-1]
+test_ds = ScientificForgeryDataset(
+    df=test_df.assign(**{colmap["id"] if colmap["id"] in test_df.columns else "__id__": test_df["__id__"]}),
+    img_size=infer_size,
+    augment=get_valid_aug(infer_size),
+    mode="test"
+)
+# Patch dataset id access: it uses colmap["id"] if in row else idx. We'll ensure 'id' column exists.
+if colmap["id"] not in test_ds.df.columns:
+    test_ds.df[colmap["id"]] = test_ds.df["__id__"]
 
-    predictions, filenames = predict_test_set(model, test_loader, CFG.DEVICE,
-                                             post_process=CFG.POST_PROCESS)
-
-    submission_path = os.path.join(CFG.OUTPUT_DIR, 'submission.csv')
-    create_submission(predictions, filenames, submission_path)
-
-    # ========== PLOT TRAINING HISTORY ==========
-    try:
-        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-
-        axes[0].plot(history['train_loss'], label='Train')
-        axes[0].plot(history['val_loss'], label='Val')
-        axes[0].set_title('Loss')
-        axes[0].set_xlabel('Epoch')
-        axes[0].legend()
-        axes[0].grid(True)
-
-        axes[1].plot(history['val_f1'])
-        axes[1].set_title('F1 Score')
-        axes[1].set_xlabel('Epoch')
-        axes[1].grid(True)
-
-        axes[2].plot(history['val_iou'])
-        axes[2].set_title('IoU')
-        axes[2].set_xlabel('Epoch')
-        axes[2].grid(True)
-
-        plt.tight_layout()
-        plot_path = os.path.join(CFG.OUTPUT_DIR, 'training_history.png')
-        plt.savefig(plot_path, dpi=150)
-        plt.show()
-        print(f"✓ Training plot saved: {plot_path}")
-    except Exception as e:
-        print(f"Could not create training plot: {e}")
-
-    print("\n" + "="*80)
-    print("TRAINING COMPLETED!")
-    print("="*80)
-    print(f"✓ Best IoU: {trainer.best_iou:.4f}")
-    print(f"✓ Submission: {submission_path}")
+test_loader = DataLoader(test_ds, batch_size=max(1, CFG.batch_size//2), shuffle=False,
+                         num_workers=CFG.num_workers, pin_memory=CFG.pin_memory, drop_last=False)
 
 
-if __name__ == "__main__":
-    main()
+# %% [markdown]
+# ## [Cell 10] Post-processing (morph close + CC filtering)
+
+# %% [code]
+def post_process(prob: np.ndarray, thr: float = 0.5, min_area: int = 100) -> np.ndarray:
+    # prob: HxW float [0,1]
+    mask = (prob > thr).astype(np.uint8)
+
+    # Morphological closing
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    # Connected component filtering
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    out = np.zeros_like(mask)
+    for i in range(1, num):
+        area = stats[i, cv2.CC_STAT_AREA]
+        if area >= min_area:
+            out[labels == i] = 1
+    return out
+
+
+# %% [markdown]
+# ## [Cell 11] Ensemble (3 models × 5 folds) with weights (0.40 / 0.35 / 0.25)
+
+# %% [code]
+def load_best_final_stage(model_name: str, fold: int) -> str:
+    # Prefer final stage 512
+    patt = os.path.join(CFG.save_dir, f"best_{model_name}_fold{fold}_stage512.pth")
+    if os.path.exists(patt):
+        return patt
+    # fallback: any best_... for fold, take latest
+    cands = sorted(glob.glob(os.path.join(CFG.save_dir, f"best_{model_name}_fold{fold}_stage*.pth")))
+    return cands[-1] if cands else ""
+
+@torch.no_grad()
+def infer_all_models_ensemble():
+    # returns: dict id -> prob(HxW)
+    final_probs = None
+    final_ids = None
+
+    # For memory safety: accumulate in float32 on CPU per chunk
+    # We'll build N x H x W arrays on CPU (can be big). If too big, you can stream-save per image.
+    for (spec_i, (model_name, arch, encoder)) in enumerate(MODEL_SPECS):
+        w_model = CFG.ens_w[spec_i]
+        print("\nEnsembling:", model_name, "weight=", w_model)
+
+        # average over folds
+        fold_probs_sum = None
+
+        for fold in range(CFG.num_folds):
+            ckpt_path = load_best_final_stage(model_name, fold)
+            if not ckpt_path:
+                print(f"⚠️ Missing checkpoint for {model_name} fold {fold}, skipping.")
+                continue
+
+            model = try_create_model(arch, encoder).to(device)
+            enable_grad_checkpointing(model)
+
+            ckpt = torch.load(ckpt_path, map_location="cpu")
+            model.load_state_dict(ckpt["model"])
+            thr = float(ckpt.get("best_thr", CFG.default_thr))
+            print(f"  Fold {fold}: ckpt={os.path.basename(ckpt_path)} thr={thr}")
+
+            ids, probs = predict_model(model, test_loader, tta=CFG.tta, tta_modes=CFG.tta_modes)
+
+            # Ensure consistent order
+            if final_ids is None:
+                final_ids = ids
+            else:
+                assert final_ids == ids, "ID order mismatch across models/folds."
+
+            # probs: Nx1xHxW
+            probs = probs[:,0]  # NxHxW
+
+            if fold_probs_sum is None:
+                fold_probs_sum = probs
+            else:
+                fold_probs_sum += probs
+
+            del model
+            cleanup_cuda()
+
+        if fold_probs_sum is None:
+            continue
+
+        fold_probs_avg = fold_probs_sum / float(CFG.num_folds)
+
+        if final_probs is None:
+            final_probs = w_model * fold_probs_avg
+        else:
+            final_probs += w_model * fold_probs_avg
+
+    return final_ids, final_probs  # ids list, probs tensor NxHxW
+
+ids, probs = infer_all_models_ensemble()
+print("Ensemble probs:", probs.shape)
+
+
+# %% [markdown]
+# ## [Cell 12] Submission Generation (RLE)
+
+# %% [code]
+# Determine submission columns (from sample_submission if available)
+if sample_sub is not None:
+    sub_id_col = sample_sub.columns[0]
+    sub_rle_col = sample_sub.columns[1] if sample_sub.shape[1] > 1 else "rle"
+else:
+    sub_id_col, sub_rle_col = "id", "rle"
+
+# Postprocess + RLE encode
+rles = []
+for i in tqdm(range(len(ids))):
+    prob = probs[i].numpy()  # HxW at infer_size
+    # Use a global threshold; if you want per-fold thresholding, keep a tuned thr (already saved per fold), but ensemble mixes folds.
+    thr = CFG.default_thr
+    mask = post_process(prob, thr=thr, min_area=CFG.min_area)
+    rles.append(rle_encode(mask, order="F"))
+
+submission = pd.DataFrame({sub_id_col: ids, sub_rle_col: rles})
+sub_path = os.path.join(CFG.save_dir, "submission.csv")
+submission.to_csv(sub_path, index=False)
+print("Saved:", sub_path)
+print(submission.head())
+
+
+# %% [markdown]
+# ## [Cell 13] Cleanup & Memory
+
+# %% [code]
+del probs
+cleanup_cuda()
+print("Done.")

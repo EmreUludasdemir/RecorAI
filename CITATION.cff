@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "RecorAI: Scientific Image Forgery Detection"
+version: 1.0.0
+date-released: 2024-12-22
+url: "https://github.com/EmreUludasdemir/RecorAI"
+repository-code: "https://github.com/EmreUludasdemir/RecorAI"
+license: MIT
+keywords:
+  - deep-learning
+  - image-segmentation
+  - forgery-detection
+  - scientific-images
+  - pytorch
+  - kaggle
+authors:
+  - family-names: "Uludasdemir"
+    given-names: "Emre"
+    orcid: "https://orcid.org/0000-0000-0000-0000"
+abstract: >-
+  A state-of-the-art deep learning solution for detecting 
+  copy-move forgeries in scientific images including microscopy, 
+  Western blots, and gel electrophoresis images. Built for the 
+  Kaggle Recod.ai/LUC Scientific Image Forgery Detection competition.

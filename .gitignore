@@ -24,10 +24,11 @@ wheels/
 venv/
 env/
 ENV/
-.venv
+.venv/
+.conda/
 
 # Jupyter Notebook
-.ipynb_checkpoints
+.ipynb_checkpoints/
 *.ipynb
 
 # IDE
@@ -36,6 +37,9 @@ ENV/
 *.swp
 *.swo
 *~
+.spyderproject
+.spyproject
+.ropeproject
 
 # Data
 data/
@@ -45,19 +49,26 @@ data/
 models/*.pth
 models/*.pt
 models/*.ckpt
+models/*.h5
+models/*.onnx
 !models/.gitkeep
 
 # Outputs
 outputs/
+submissions/
 !outputs/.gitkeep
 
 # Logs
 logs/
 *.log
+wandb/
+mlruns/
+tensorboard/
 
 # OS
 .DS_Store
 Thumbs.db
+desktop.ini
 
 # Kaggle
 kaggle.json
@@ -66,3 +77,24 @@ kaggle.json
 *.tmp
 *.bak
 *.cache
+*.swp
+.temp/
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# MyPy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Secrets
+.env
+.env.local
+*.pem
+*.key
+secrets/
